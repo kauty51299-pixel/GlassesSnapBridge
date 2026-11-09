@@ -27,6 +27,7 @@ import com.meta.wearable.dat.camera.Camera
 import com.meta.wearable.dat.camera.addCamera
 import com.meta.wearable.dat.camera.types.StreamConfiguration
 import com.meta.wearable.dat.camera.types.StreamState
+import com.meta.wearable.dat.camera.types.StreamError
 import com.meta.wearable.dat.camera.types.VideoQuality
 import com.meta.wearable.dat.core.Wearables
 import com.meta.wearable.dat.core.selectors.AutoDeviceSelector
@@ -36,6 +37,7 @@ import com.meta.wearable.dat.core.types.Permission
 import com.meta.wearable.dat.core.types.PermissionStatus
 import com.meta.wearable.dat.core.types.RegistrationState
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.first
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.concurrent.Executors
@@ -73,6 +75,11 @@ class MainActivity : ComponentActivity() {
     private var preparingRecording = false
     private var autoPreviewPending = false
     private var queuedSeconds: Int? = null
+    private var connectJob: Job? = null
+    private var failureJob: Job? = null
+    private var reconnectAfterUnregister = false
+    private var registrationPending = false
+    private val connectionLog = ArrayDeque<String>()
     private var timer: Job? = null
     private var connectionTimeout: Job? = null
     private var latest: File? = null
@@ -124,7 +131,13 @@ class MainActivity : ComponentActivity() {
                     Wearables.registrationState.collect { state ->
                         val wasRegistered = registered
                         registered = state == RegistrationState.REGISTERED
+                        trace("Registration: $state; developer mode: ${Wearables.isDevMode}")
                         if (registered && !wasRegistered) autoPreviewPending = true
+                        if (reconnectAfterUnregister && state == RegistrationState.AVAILABLE) {
+                            reconnectAfterUnregister = false
+                            registrationPending = true
+                            registerIfReady()
+                        }
                         if (!recording && !busy) message(if (registered) "Connected. Choose Record 30 s or Record 60 s." else "Tap Connect Meta AI to link this app.")
                         if (!registered && session != null) endSession("Meta AI connection ended.")
                         controls()
@@ -170,26 +183,52 @@ class MainActivity : ComponentActivity() {
 
     private fun startSession() {
         if (session != null || !foreground) return
+        if (!Wearables.isDevMode) {
+            busy = false; queuedSeconds = null
+            message("Meta registered this app without Developer Mode. Tap Reset Meta connection, enable Developer Mode in Meta AI, and approve the connection again.")
+            trace("Start blocked: SDK developer mode is false")
+            controls()
+            return
+        }
         busy = true; controls()
-        message("Connecting to glasses…")
-        scope.launch {
+        message("Waiting for Meta to make the glasses available…")
+        connectJob?.cancel()
+        connectJob = scope.launch {
             try {
-                Wearables.createSession(AutoDeviceSelector()).onSuccess { created ->
+                val selector = AutoDeviceSelector()
+                val eligible = withTimeoutOrNull(20_000) { selector.activeDeviceFlow().first { it != null } }
+                if (eligible == null) {
+                    busy = false; queuedSeconds = null
+                    trace("No eligible glasses after 20 seconds; dev mode: ${Wearables.isDevMode}")
+                    message("Meta has not made any glasses available to this app. Keep them worn and connected. Use Reset Meta connection, or Update glasses runtime if Meta AI requests an installation.")
+                    controls()
+                    return@launch
+                }
+                if (!foreground || destroyed) { busy = false; controls(); return@launch }
+                message("Starting the glasses camera…")
+                trace("Eligible glasses found; starting session; dev mode: ${Wearables.isDevMode}")
+                val failures = ConnectionFailure()
+                Wearables.createSession(selector).onSuccess { created ->
                     session = created
                     val jobs = CoroutineScope(SupervisorJob(scope.coroutineContext[Job]) + Dispatchers.Main.immediate)
                     sessionScope = jobs
                     jobs.launch {
                         created.errors.collect { error ->
-                            message(error.description)
-                            endSession("Connection error: ${error.description}")
+                            failures.add(error.toString(), error.description)
+                            trace("Session error: $error — ${error.description}")
+                            finishFailedSession(created, failures)
                         }
                     }
                     jobs.launch {
                         created.state.collect { state ->
+                            trace("Session state: $state")
                             when (state) {
                                 DeviceSessionState.STARTED -> if (camera == null) attachCamera(created, jobs)
                                 DeviceSessionState.PAUSED -> { streaming = false; controls(); endSession("Glasses paused. Your clip was stopped.") }
-                                DeviceSessionState.STOPPED -> endSession("Glasses disconnected.")
+                                DeviceSessionState.STOPPED -> {
+                                    failures.add("SESSION_STOPPED", "The SDK reports that the device session stopped.")
+                                    finishFailedSession(created, failures)
+                                }
                                 else -> Unit
                             }
                         }
@@ -200,16 +239,72 @@ class MainActivity : ComponentActivity() {
                         delay(20_000)
                         if (!streaming && session === created) endSession("No camera frames received. Check Bluetooth, Meta AI Developer Mode, and glasses firmware.")
                     }
-                }.onFailure { error, _ -> busy = false; queuedSeconds = null; message(error.description); controls() }
-            } catch (e: Exception) { busy = false; endSession("Connection failed: ${e.message}") }
+                }.onFailure { error, _ ->
+                    failures.add(error.toString(), error.description)
+                    trace("Create session failed: $error — ${error.description}")
+                    busy = false; queuedSeconds = null; message(failures.recoveryMessage()); controls()
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { busy = false; endSession("Connection failed: ${e.message}") }
         }
     }
 
+    private fun finishFailedSession(created: DeviceSession, failures: ConnectionFailure) {
+        if (session !== created || failureJob?.isActive == true) return
+        // Meta often emits SESSION_ENDED_BY_DEVICE followed by the actionable error.
+        // Keep collecting briefly before stopping the listener and discarding the session.
+        failureJob = scope.launch {
+            delay(500)
+            if (session === created) endSession(failures.recoveryMessage())
+        }
+    }
+
+    private fun trace(event: String) {
+        if (connectionLog.size >= 40) connectionLog.removeFirst()
+        connectionLog.addLast("${SystemClock.elapsedRealtime() / 1000}s $event")
+    }
+
+    private fun registerIfReady() {
+        if (!registrationPending || !foreground || !initialized) return
+        if (Wearables.registrationState.value != RegistrationState.AVAILABLE) return
+        registrationPending = false
+        trace("Requesting fresh registration")
+        runCatching { Wearables.startRegistration(this) }
+            .onFailure { message("Meta registration could not open: ${it.message}") }
+    }
+
+    private fun resetMetaConnection() {
+        if (!initialized || recording || saving || preparingRecording) return
+        autoPreviewPending = false
+        endSession("Resetting this app's Meta connection…")
+        trace("User requested connection reset")
+        if (Wearables.registrationState.value == RegistrationState.REGISTERED) {
+            reconnectAfterUnregister = true
+            runCatching { Wearables.startUnregistration(this) }
+                .onFailure { reconnectAfterUnregister = false; message("Could not reset Meta connection: ${it.message}") }
+        } else {
+            registrationPending = true
+            registerIfReady()
+        }
+    }
+
+    private fun copyConnectionDetails() {
+        val state = if (initialized) "Registration: ${Wearables.registrationState.value}\nSDK developer mode: ${Wearables.isDevMode}\nVisible glasses: ${Wearables.devices.value.size}" else "SDK not initialized"
+        val report = "Glasses Snap Bridge v0.3\nAndroid ${Build.VERSION.RELEASE} / API ${Build.VERSION.SDK_INT}\nPhone: ${Build.MANUFACTURER} ${Build.MODEL}\n$state\n\nStatus: ${status.text}\n\n${connectionLog.joinToString("\n")}"
+        val clipboard = getSystemService(android.content.ClipboardManager::class.java)
+        clipboard.setPrimaryClip(ClipData.newPlainText("Connection details", report))
+        Toast.makeText(this, "Connection details copied. Paste them into this chat.", Toast.LENGTH_LONG).show()
+    }
+
     private suspend fun attachCamera(created: DeviceSession, jobs: CoroutineScope) {
-        created.addCamera(StreamConfiguration(videoQuality = VideoQuality.HIGH, frameRate = 24)).onSuccess { added ->
+        created.addCamera(StreamConfiguration(videoQuality = VideoQuality.MEDIUM, frameRate = 24)).onSuccess { added ->
             camera = added
             jobs.launch {
-                added.stream.errorStream.collect { error -> endSession("Camera error: ${error.description}") }
+                added.stream.errorStream.collect { error ->
+                    trace("Stream error: $error — ${error.description}")
+                    if (error == StreamError.STREAM_ERROR) message("Camera warning: ${error.description}")
+                    else endSession("Camera error: $error — ${error.description}")
+                }
             }
             jobs.launch {
                 added.stream.state.collect { state ->
@@ -350,6 +445,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun endSession(reason: String = "Preview ended.") {
+        failureJob?.cancel(); failureJob = null
+        connectJob?.cancel(); connectJob = null
         queuedSeconds = null
         val oldSession = session
         val oldCamera = camera
@@ -530,10 +627,22 @@ class MainActivity : ComponentActivity() {
                 }.show()
         }
         row(save, remove)
+        root.addView(button("Reset Meta connection") { resetMetaConnection() })
+        root.addView(button("Update glasses runtime") {
+            if (initialized && !recording && !saving) {
+                Wearables.openDATGlassesAppUpdate(this).onFailure { error, _ -> message(error.description) }
+            }
+        })
+        root.addView(button("Update glasses firmware") {
+            if (initialized && !recording && !saving) {
+                Wearables.openFirmwareUpdate(this).onFailure { error, _ -> message(error.description) }
+            }
+        })
+        root.addView(button("Copy connection details") { copyConnectionDetails() })
         root.addView(button("Import an existing MP4 clip") {
             if (!recording && !busy) importVideo.launch(arrayOf("video/mp4"))
         })
-        root.addView(text("Keep this app open while recording. Snapchat opens with the saved clip when the option above is on.\nDeveloper prototype v0.2 • Requires Meta AI Developer Mode.", 12f, Color.GRAY))
+        root.addView(text("Keep this app open while recording. Snapchat opens with the saved clip when the option above is on.\nDeveloper prototype v0.3 • Requires Meta AI Developer Mode.", 12f, Color.GRAY))
         setContentView(ScrollView(this).apply { addView(root) })
     }
 
@@ -543,6 +652,7 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         foreground = true
         controls()
+        registerIfReady()
         maybeAutoPreview()
         if (queuedSeconds != null) {
             if (streaming && !busy) startQueuedRecording()
@@ -558,11 +668,14 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         super.onStop()
         queuedSeconds = null
+        connectJob?.cancel(); connectJob = null
+        if (session == null) { busy = false; controls() }
         if (session != null) endSession("Preview ended because the app left the screen. Any recording was stopped and saved.")
     }
 
     override fun onDestroy() {
         destroyed = true
+        connectJob?.cancel(); failureJob?.cancel()
         connectionTimeout?.cancel()
         timer?.cancel()
         sessionScope?.cancel()
