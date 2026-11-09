@@ -7,8 +7,8 @@ android {
         applicationId = "com.sunny.glassesbridge"
         minSdk = 31
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.3.0-prototype"
+        versionCode = 4
+        versionName = "0.4.0-button-preview"
         manifestPlaceholders["mwdat_application_id"] = "0"
         manifestPlaceholders["mwdat_client_token"] = "0"
     }
@@ -27,4 +27,5 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("com.meta.wearable:mwdat-core:1.0.1")
     implementation("com.meta.wearable:mwdat-camera:1.0.1")
+    implementation("com.meta.wearable:mwdat-inputs:1.0.1")
 }

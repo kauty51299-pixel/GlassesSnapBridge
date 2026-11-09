@@ -10,6 +10,8 @@ import android.graphics.Color
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -36,6 +38,14 @@ import com.meta.wearable.dat.core.session.DeviceSessionState
 import com.meta.wearable.dat.core.types.Permission
 import com.meta.wearable.dat.core.types.PermissionStatus
 import com.meta.wearable.dat.core.types.RegistrationState
+import com.meta.wearable.dat.inputs.Inputs
+import com.meta.wearable.dat.inputs.addInputs
+import com.meta.wearable.dat.inputs.removeInputs
+import com.meta.wearable.dat.inputs.types.CapturePressType
+import com.meta.wearable.dat.inputs.types.InputEvent
+import com.meta.wearable.dat.inputs.types.InputSource
+import com.meta.wearable.dat.inputs.types.InputsConfiguration
+import com.meta.wearable.dat.inputs.types.InputsState
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 import java.io.ByteArrayOutputStream
@@ -60,6 +70,17 @@ class MainActivity : ComponentActivity() {
     private lateinit var remove: Button
     private lateinit var sound: CheckBox
     private lateinit var autoSnap: CheckBox
+    private lateinit var handsFree: CheckBox
+    private lateinit var handsFreeStatus: TextView
+    private lateinit var handsFreeDuration: RadioGroup
+    private var inputs: Inputs? = null
+    private var inputCollectors: Job? = null
+    private var inputTimeout: Job? = null
+    private var inputAttaching = false
+    private var inputActive = false
+    private val doublePress = DoublePressGate(650)
+    private val duration30Id = View.generateViewId()
+    private val duration60Id = View.generateViewId()
     private var initialized = false
     private var initAttempted = false
     private var registered = false
@@ -290,7 +311,7 @@ class MainActivity : ComponentActivity() {
 
     private fun copyConnectionDetails() {
         val state = if (initialized) "Registration: ${Wearables.registrationState.value}\nSDK developer mode: ${Wearables.isDevMode}\nVisible glasses: ${Wearables.devices.value.size}" else "SDK not initialized"
-        val report = "Glasses Snap Bridge v0.3\nAndroid ${Build.VERSION.RELEASE} / API ${Build.VERSION.SDK_INT}\nPhone: ${Build.MANUFACTURER} ${Build.MODEL}\n$state\n\nStatus: ${status.text}\n\n${connectionLog.joinToString("\n")}"
+        val report = "Glasses Snap Bridge v0.4\nAndroid ${Build.VERSION.RELEASE} / API ${Build.VERSION.SDK_INT}\nPhone: ${Build.MANUFACTURER} ${Build.MODEL}\n$state\n\nStatus: ${status.text}\n\n${connectionLog.joinToString("\n")}"
         val clipboard = getSystemService(android.content.ClipboardManager::class.java)
         clipboard.setPrimaryClip(ClipData.newPlainText("Connection details", report))
         Toast.makeText(this, "Connection details copied. Paste them into this chat.", Toast.LENGTH_LONG).show()
@@ -342,6 +363,7 @@ class MainActivity : ComponentActivity() {
                                         message("Camera ready. Choose Record 30 s or Record 60 s.")
                                         controls()
                                         startQueuedRecording()
+                                        maybeAttachInputs()
                                     }
                                 }
                             }
@@ -365,6 +387,107 @@ class MainActivity : ComponentActivity() {
             message("${seconds} s selected. Waiting for the glasses camera…")
             if (session == null && !busy) requestPreview()
             controls()
+        }
+    }
+
+    private fun maybeAttachInputs() {
+        val activeSession = session ?: return
+        val jobs = sessionScope ?: return
+        if (!handsFree.isChecked || !foreground || !streaming || inputs != null || inputAttaching) return
+        inputAttaching = true
+        handsFreeStatus.text = "Checking glasses button access…"
+        jobs.launch {
+            try {
+                activeSession.addInputs(InputsConfiguration(sources = setOf(InputSource.CAPTURE_BUTTON), consumeBack = false))
+                    .onSuccess { capability ->
+                        if (!handsFree.isChecked || session !== activeSession) {
+                            inputAttaching = false
+                            activeSession.removeInputs().onFailure { error, _ -> trace("Remove late inputs: ${error.description}") }
+                            return@onSuccess
+                        }
+                        inputs = capability
+                        inputAttaching = false
+                        inputCollectors = jobs.launch {
+                            launch {
+                                capability.state.collect { state ->
+                                    inputActive = state == InputsState.ACTIVE
+                                    doublePress.reset()
+                                    trace("Inputs state: $state")
+                                    handsFreeStatus.text = if (inputActive) "Button ready. Double-press the capture button to record ${if (handsFreeDuration.checkedRadioButtonId == duration60Id) 60 else 30} s."
+                                        else "Glasses button: $state. Wait for Button ready."
+                                    if (inputActive) { inputTimeout?.cancel(); beep(ToneGenerator.TONE_PROP_BEEP) }
+                                    controls()
+                                }
+                            }
+                            launch {
+                                capability.errors.collect { error ->
+                                    if (error != null) {
+                                        inputActive = false; doublePress.reset()
+                                        trace("Inputs error: $error — ${error.description}")
+                                        handsFreeStatus.text = "Glasses button unavailable: ${error.description}. Meta may need to enable Inputs for this app. On-screen recording still works."
+                                        controls()
+                                    }
+                                }
+                            }
+                            launch {
+                                capability.events.collect { event ->
+                                    when (event) {
+                                        is InputEvent.Capture -> {
+                                            trace("Capture button: ${event.pressType}")
+                                            if (event.source == InputSource.CAPTURE_BUTTON && event.pressType == CapturePressType.SHORT_PRESS) {
+                                                val canStart = handsFree.isChecked && inputActive && foreground && streaming && !recording && !saving && !preparingRecording && !busy
+                                                if (canStart && doublePress.shortPress(SystemClock.elapsedRealtime())) {
+                                                    autoSnap.isChecked = true
+                                                    record(if (handsFreeDuration.checkedRadioButtonId == duration60Id) 60 else 30)
+                                                } else if (!canStart) doublePress.reset()
+                                            } else doublePress.reset()
+                                        }
+                                        is InputEvent.Nav, is InputEvent.Select, is InputEvent.Back,
+                                        is InputEvent.Button, is InputEvent.Drag -> Unit
+                                    }
+                                }
+                            }
+                        }
+                        inputTimeout = jobs.launch {
+                            delay(12_000)
+                            if (!inputActive && inputs === capability) handsFreeStatus.text = "Glasses button did not activate. Meta Inputs enablement may be required. On-screen recording still works."
+                        }
+                    }.onFailure { error, _ ->
+                        inputAttaching = false
+                        trace("Inputs unavailable: $error — ${error.description}")
+                        handsFreeStatus.text = "Glasses button unavailable: ${error.description}. This experimental feature may need Meta Inputs approval."
+                    }
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                inputAttaching = false
+                handsFreeStatus.text = "Glasses button unavailable: ${e.message}"
+            }
+        }
+    }
+
+    private fun disarmInputs() {
+        doublePress.reset(); inputActive = false
+        inputTimeout?.cancel(); inputTimeout = null
+        inputCollectors?.cancel(); inputCollectors = null
+        val attached = inputs
+        inputs = null
+        inputAttaching = false
+        val activeSession = session
+        if (attached != null && activeSession != null) scope.launch {
+            activeSession.removeInputs().onFailure { error, _ -> trace("Remove inputs: ${error.description}") }
+        }
+        handsFreeStatus.text = "Glasses button off."
+    }
+
+    private fun beep(tone: Int) {
+        scope.launch {
+            var generator: ToneGenerator? = null
+            try {
+                generator = ToneGenerator(AudioManager.STREAM_MUSIC, 65)
+                generator.startTone(tone, 130)
+                delay(180)
+            } catch (_: Exception) { /* Audio routing must never prevent recording. */ }
+            finally { generator?.release() }
         }
     }
 
@@ -402,6 +525,8 @@ class MainActivity : ComponentActivity() {
                     return@launch
                 }
                 preparingRecording = false; recording = true; busy = false
+                doublePress.reset()
+                if (handsFree.isChecked) beep(ToneGenerator.TONE_PROP_BEEP2)
                 window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 message(created.soundWarning ?: if (withSound) "Recording with phone microphone." else "Recording without sound.")
                 controls()
@@ -434,6 +559,7 @@ class MainActivity : ComponentActivity() {
                 }
                 latest = result.first
                 savedSuccessfully = true
+                if (handsFree.isChecked) beep(ToneGenerator.TONE_PROP_ACK)
                 message(result.second ?: "Video ready. Tap Open in Snapchat.")
                 showSaved()
             } catch (e: Exception) { message("Video could not be saved: ${e.message}") }
@@ -445,6 +571,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun endSession(reason: String = "Preview ended.") {
+        doublePress.reset(); inputActive = false; inputAttaching = false
+        inputTimeout?.cancel(); inputTimeout = null
+        inputCollectors?.cancel(); inputCollectors = null
+        inputs = null
+        handsFreeStatus.text = if (handsFree.isChecked) "Glasses button waiting for connection." else "Glasses button off."
         failureJob?.cancel(); failureJob = null
         connectJob?.cancel(); connectJob = null
         queuedSeconds = null
@@ -558,6 +689,11 @@ class MainActivity : ComponentActivity() {
         disconnect.isEnabled = session != null && !busy
         sound.isEnabled = !recording && !busy
         autoSnap.isEnabled = !recording && !busy
+        handsFree.isEnabled = !recording && !saving && !preparingRecording
+        handsFreeDuration.isEnabled = !recording && !saving && !preparingRecording
+        for (i in 0 until handsFreeDuration.childCount) handsFreeDuration.getChildAt(i).isEnabled = handsFreeDuration.isEnabled
+        if (foreground && (recording || (handsFree.isChecked && session != null))) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val canShare = latest?.exists() == true && !recording && !busy
         share.isEnabled = canShare; save.isEnabled = canShare; remove.isEnabled = canShare
     }
@@ -594,6 +730,34 @@ class MainActivity : ComponentActivity() {
         root.addView(status)
         clock = text("Choose 30 or 60 seconds", 22f).apply { gravity = Gravity.CENTER }
         root.addView(clock)
+        handsFreeDuration = RadioGroup(this).apply {
+            orientation = RadioGroup.HORIZONTAL
+            addView(RadioButton(this@MainActivity).apply { id = duration30Id; text = "Button: 30 s"; setTextColor(Color.WHITE) })
+            addView(RadioButton(this@MainActivity).apply { id = duration60Id; text = "Button: 60 s"; setTextColor(Color.WHITE) })
+            check(duration30Id)
+            setOnCheckedChangeListener { _, _ ->
+                doublePress.reset()
+                if (inputActive) handsFreeStatus.text = "Button ready. Double-press to record ${if (checkedRadioButtonId == duration60Id) 60 else 30} s."
+            }
+        }
+        root.addView(handsFreeDuration)
+        handsFreeStatus = text("Glasses button off. Requires Meta Inputs access.", 13f, Color.LTGRAY)
+        handsFree = CheckBox(this).apply {
+            text = "Arm glasses double-press (experimental)"; setTextColor(Color.WHITE)
+            setOnCheckedChangeListener { _, armed ->
+                doublePress.reset()
+                if (armed) {
+                    autoSnap.isChecked = true
+                    handsFreeStatus.text = "Connecting the glasses button…"
+                    if (streaming) maybeAttachInputs()
+                    else if (registered && !busy && session == null) requestPreview()
+                    else if (!registered) handsFreeStatus.text = "Connect Meta AI first, then wait for Button ready."
+                } else disarmInputs()
+                controls()
+            }
+        }
+        root.addView(handsFree)
+        root.addView(handsFreeStatus)
         record30 = button("Record 30 s") { record(30) }
         record60 = button("Record 60 s") { record(60) }
         row(record30, record60)
@@ -642,7 +806,7 @@ class MainActivity : ComponentActivity() {
         root.addView(button("Import an existing MP4 clip") {
             if (!recording && !busy) importVideo.launch(arrayOf("video/mp4"))
         })
-        root.addView(text("Keep this app open while recording. Snapchat opens with the saved clip when the option above is on.\nDeveloper prototype v0.3 • Requires Meta AI Developer Mode.", 12f, Color.GRAY))
+        root.addView(text("Keep this app open while recording. Snapchat opens with the saved clip when the option above is on.\nDeveloper prototype v0.4 • Requires Meta AI Developer Mode.", 12f, Color.GRAY))
         setContentView(ScrollView(this).apply { addView(root) })
     }
 
@@ -651,6 +815,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         foreground = true
+        if (handsFree.isChecked && registered && session == null) autoPreviewPending = true
         controls()
         registerIfReady()
         maybeAutoPreview()
@@ -675,6 +840,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         destroyed = true
+        inputCollectors?.cancel(); inputTimeout?.cancel()
         connectJob?.cancel(); failureJob?.cancel()
         connectionTimeout?.cancel()
         timer?.cancel()
