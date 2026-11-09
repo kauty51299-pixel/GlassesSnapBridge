@@ -1,0 +1,506 @@
+package com.sunny.glassesbridge
+
+import android.Manifest
+import android.content.ClipData
+import android.content.ContentValues
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
+import android.graphics.Color
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.YuvImage
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.SystemClock
+import android.provider.MediaStore
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
+import android.widget.*
+import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import com.meta.wearable.dat.camera.Camera
+import com.meta.wearable.dat.camera.addCamera
+import com.meta.wearable.dat.camera.types.StreamConfiguration
+import com.meta.wearable.dat.camera.types.StreamState
+import com.meta.wearable.dat.camera.types.VideoQuality
+import com.meta.wearable.dat.core.Wearables
+import com.meta.wearable.dat.core.selectors.AutoDeviceSelector
+import com.meta.wearable.dat.core.session.DeviceSession
+import com.meta.wearable.dat.core.session.DeviceSessionState
+import com.meta.wearable.dat.core.types.Permission
+import com.meta.wearable.dat.core.types.PermissionStatus
+import com.meta.wearable.dat.core.types.RegistrationState
+import kotlinx.coroutines.*
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.util.concurrent.Executors
+
+class MainActivity : ComponentActivity() {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val worker = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+    private lateinit var status: TextView
+    private lateinit var clock: TextView
+    private lateinit var saved: TextView
+    private lateinit var preview: ImageView
+    private lateinit var connect: Button
+    private lateinit var start: Button
+    private lateinit var record30: Button
+    private lateinit var record60: Button
+    private lateinit var stop: Button
+    private lateinit var disconnect: Button
+    private lateinit var share: Button
+    private lateinit var save: Button
+    private lateinit var remove: Button
+    private lateinit var sound: CheckBox
+    private var initialized = false
+    private var initAttempted = false
+    private var registered = false
+    private var destroyed = false
+    private var session: DeviceSession? = null
+    private var camera: Camera? = null
+    private var sessionScope: CoroutineScope? = null
+    private var streaming = false
+    private var recording = false
+    private var busy = false
+    private var timer: Job? = null
+    private var connectionTimeout: Job? = null
+    private var latest: File? = null
+    private var requestedSeconds = 30
+    // Only the single recording worker touches recorder or frame dimensions.
+    private var recorder: ClipRecorder? = null
+    private var width = 0
+    private var height = 0
+    private var lastPreview = 0L
+    @Volatile private var lastFrameMs = 0L
+
+    private val bluetoothPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) connectMeta() else message("Allow Nearby devices in Android Settings to connect the glasses.")
+    }
+    private val microphonePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (!granted) { sound.isChecked = false; message("Microphone permission denied. The clip will be silent.") }
+        beginRecording(requestedSeconds)
+    }
+    private val glassesPermission = registerForActivityResult(Wearables.RequestPermissionContract()) { result ->
+        result.onSuccess { permission ->
+            if (permission == PermissionStatus.Granted) startSession()
+            else { busy = false; message("Camera access was declined in Meta AI."); controls() }
+        }.onFailure { error, _ -> busy = false; message(error.description); controls() }
+    }
+    private val importVideo = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) importClip(uri)
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        buildUi()
+        latest = recordings().listFiles()?.filter { it.name.matches(Regex("glasses-[0-9]+\\.mp4")) }
+            ?.maxByOrNull { it.lastModified() }
+        showSaved()
+        controls()
+        if (Build.VERSION.SDK_INT >= 31 && ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            message("Tap Connect Meta AI to allow Nearby devices and link the glasses.")
+        } else initialize()
+    }
+
+    private fun initialize() {
+        if (initialized || initAttempted) return
+        initAttempted = true
+        try {
+            Wearables.initialize(applicationContext).onSuccess {
+                initialized = true
+                scope.launch {
+                    Wearables.registrationState.collect { state ->
+                        registered = state == RegistrationState.REGISTERED
+                        if (!recording && !busy) message(if (registered) "Connected to Meta AI. Tap Preview glasses." else "Tap Connect Meta AI to link this app.")
+                        if (!registered && session != null) endSession("Meta AI connection ended.")
+                        controls()
+                    }
+                }
+                scope.launch {
+                    Wearables.registrationErrorStream.collect { error -> message(error.description) }
+                }
+            }.onFailure { error, _ -> message("Meta setup: ${error.description}") }
+        } catch (e: Exception) { message("Meta setup: ${e.message}") }
+        if (!initialized) initAttempted = false
+        controls()
+    }
+
+    private fun connectMeta() {
+        if (Build.VERSION.SDK_INT >= 31 && ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            bluetoothPermission.launch(Manifest.permission.BLUETOOTH_CONNECT)
+            return
+        }
+        initialize()
+        if (initialized) runCatching { Wearables.startRegistration(this) }
+            .onFailure { message("Could not open Meta AI: ${it.message}") }
+    }
+
+    private fun requestPreview() {
+        if (!initialized || !registered || session != null || busy) return
+        busy = true; controls()
+        scope.launch {
+            try {
+                Wearables.checkPermissionStatus(Permission.CAMERA).onSuccess {
+                    if (it == PermissionStatus.Granted) startSession() else glassesPermission.launch(Permission.CAMERA)
+                }.onFailure { error, _ -> busy = false; message(error.description); controls() }
+            } catch (e: Exception) { busy = false; message(e.message ?: "Camera permission failed."); controls() }
+        }
+    }
+
+    private fun startSession() {
+        if (session != null) return
+        message("Connecting to glasses…")
+        scope.launch {
+            try {
+                Wearables.createSession(AutoDeviceSelector()).onSuccess { created ->
+                    session = created
+                    val jobs = CoroutineScope(SupervisorJob(scope.coroutineContext[Job]) + Dispatchers.Main.immediate)
+                    sessionScope = jobs
+                    jobs.launch {
+                        created.errors.collect { error ->
+                            message(error.description)
+                            endSession("Connection error: ${error.description}")
+                        }
+                    }
+                    jobs.launch {
+                        created.state.collect { state ->
+                            when (state) {
+                                DeviceSessionState.STARTED -> if (camera == null) attachCamera(created, jobs)
+                                DeviceSessionState.PAUSED -> { streaming = false; controls(); endSession("Glasses paused. Your clip was stopped.") }
+                                DeviceSessionState.STOPPED -> endSession("Glasses disconnected.")
+                                else -> Unit
+                            }
+                        }
+                    }
+                    created.start()
+                    connectionTimeout?.cancel()
+                    connectionTimeout = scope.launch {
+                        delay(20_000)
+                        if (!streaming && session === created) endSession("No camera frames received. Check Bluetooth, Meta AI Developer Mode, and glasses firmware.")
+                    }
+                }.onFailure { error, _ -> busy = false; message(error.description); controls() }
+            } catch (e: Exception) { busy = false; endSession("Connection failed: ${e.message}") }
+        }
+    }
+
+    private suspend fun attachCamera(created: DeviceSession, jobs: CoroutineScope) {
+        created.addCamera(StreamConfiguration(videoQuality = VideoQuality.HIGH, frameRate = 24)).onSuccess { added ->
+            camera = added
+            jobs.launch {
+                added.stream.errorStream.collect { error -> endSession("Camera error: ${error.description}") }
+            }
+            jobs.launch {
+                added.stream.state.collect { state ->
+                    if (state == StreamState.PAUSED || state == StreamState.CLOSED || (state == StreamState.STOPPED && streaming)) {
+                        endSession("Camera stopped. Your clip was stopped.")
+                    }
+                }
+            }
+            jobs.launch {
+                try {
+                    added.stream.videoStream.collect { frame ->
+                        // Copy immediately: the SDK can reuse this ByteBuffer after delivery.
+                        val source = frame.buffer.duplicate()
+                        val bytes = ByteArray(source.remaining())
+                        source.get(bytes)
+                        val w = frame.width
+                        val h = frame.height
+                        val arrival = SystemClock.elapsedRealtime()
+                        require(!frame.isCompressed && bytes.size == w * h * 3 / 2) { "Unexpected camera frame format. This prototype expects decoded I420 frames." }
+                        withContext(worker) {
+                            width = w; height = h
+                            lastFrameMs = arrival
+                            recorder?.frame(bytes, w, h, arrival)
+                            if (arrival - lastPreview >= 200) {
+                                lastPreview = arrival
+                                val jpeg = ByteArrayOutputStream()
+                                YuvImage(YuvPlanes.toNv21(bytes, w, h), ImageFormat.NV21, w, h, null)
+                                    .compressToJpeg(Rect(0, 0, w, h), 70, jpeg)
+                                val image = BitmapFactory.decodeByteArray(jpeg.toByteArray(), 0, jpeg.size())
+                                withContext(Dispatchers.Main.immediate) {
+                                    preview.setImageBitmap(image)
+                                    if (!streaming) {
+                                        streaming = true; busy = false
+                                        connectionTimeout?.cancel()
+                                        message("Glasses preview ready.")
+                                        controls()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (e: CancellationException) { throw e }
+                catch (e: Exception) { endSession("Recording interrupted: ${e.message}") }
+            }
+            added.stream.start().onFailure { error, _ -> endSession(error.description) }
+        }.onFailure { error, _ -> endSession(error.description) }
+    }
+
+    private fun record(seconds: Int) {
+        if (!streaming || recording || busy) return
+        requestedSeconds = seconds
+        if (sound.isChecked && ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+        } else beginRecording(seconds)
+    }
+
+    private fun beginRecording(seconds: Int) {
+        if (!streaming || recording || busy || destroyed) return
+        busy = true; controls()
+        val withSound = sound.isChecked
+        val initialSession = session
+        scope.launch {
+            try {
+                val created = withContext(worker) {
+                    check(width > 0 && height > 0 && SystemClock.elapsedRealtime() - lastFrameMs < 3000) { "Wait for a live glasses preview before recording." }
+                    ClipRecorder(applicationContext, width, height, withSound).also { recorder = it }
+                }
+                if (!streaming || session !== initialSession || destroyed) {
+                    withContext(worker) { recorder?.discard(); recorder = null }
+                    busy = false; controls()
+                    return@launch
+                }
+                recording = true; busy = false
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                message(created.soundWarning ?: if (withSound) "Recording with phone microphone." else "Recording without sound.")
+                controls()
+                timer = scope.launch {
+                    while (isActive && recording) {
+                        val elapsed = SystemClock.elapsedRealtime() - created.startedMs
+                        clock.text = "${(elapsed / 1000).coerceAtMost(seconds.toLong())} / $seconds s"
+                        if (elapsed >= seconds * 1000L) { finishRecording(); break }
+                        if (SystemClock.elapsedRealtime() - lastFrameMs > 5000) { endSession("Camera frames stopped. Saved the available clip."); break }
+                        delay(200)
+                    }
+                }
+            } catch (e: Exception) { busy = false; message("Could not record: ${e.message}"); controls() }
+        }
+    }
+
+    private suspend fun finishRecording() {
+        if (!recording) return
+        recording = false; busy = true
+        timer?.cancel(); timer = null
+        // Do not cancel the caller timer before its finalization runs.
+        withContext(NonCancellable) {
+            message("Saving video…"); controls()
+            try {
+                val result = withContext(worker) {
+                    val active = checkNotNull(recorder)
+                    recorder = null
+                    active.finish() to active.soundWarning
+                }
+                latest = result.first
+                message(result.second ?: "Video ready. Tap Open in Snapchat.")
+                showSaved()
+            } catch (e: Exception) { message("Video could not be saved: ${e.message}") }
+            busy = false
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            controls()
+        }
+    }
+
+    private fun endSession(reason: String = "Preview ended.") {
+        val oldSession = session
+        val oldCamera = camera
+        session = null; camera = null
+        streaming = false
+        connectionTimeout?.cancel(); connectionTimeout = null
+        sessionScope?.cancel(); sessionScope = null
+        scope.launch {
+            if (recording) finishRecording()
+            runCatching { oldCamera?.stop() }
+            runCatching { oldSession?.stop() }
+            busy = false
+            message(reason)
+            controls()
+        }
+    }
+
+    private fun shareVideo() {
+        val file = latest?.takeIf { it.exists() } ?: return
+        val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "video/mp4"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            clipData = ClipData.newRawUri("Glasses video", uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            setPackage("com.snapchat.android")
+        }
+        try { startActivity(intent) }
+        catch (e: Exception) {
+            message("Snapchat could not accept the video. Save to Gallery, then use Snapchat → Memories → Camera Roll.")
+        }
+    }
+
+    private fun saveToGallery() {
+        val file = latest?.takeIf { it.exists() } ?: return
+        busy = true; controls()
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    val values = ContentValues().apply {
+                        put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
+                        put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                        put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/GlassesSnapBridge")
+                        put(MediaStore.Video.Media.IS_PENDING, 1)
+                    }
+                    val uri = checkNotNull(contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values))
+                    try {
+                        checkNotNull(contentResolver.openOutputStream(uri)).use { output -> file.inputStream().use { it.copyTo(output) } }
+                        values.clear(); values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                        contentResolver.update(uri, values, null, null)
+                    } catch (e: Exception) { contentResolver.delete(uri, null, null); throw e }
+                }
+                message("Saved to Movies/GlassesSnapBridge. It is available in Snapchat Camera Roll.")
+            } catch (e: Exception) { message("Could not save to Gallery: ${e.message}") }
+            busy = false; controls()
+        }
+    }
+
+    private fun importClip(uri: Uri) {
+        busy = true; controls()
+        scope.launch {
+            try {
+                latest = withContext(Dispatchers.IO) {
+                    val out = File(recordings(), "glasses-${System.currentTimeMillis()}.mp4")
+                    try {
+                        checkNotNull(contentResolver.openInputStream(uri)).use { input ->
+                            out.outputStream().use { output ->
+                                val block = ByteArray(64 * 1024)
+                                var total = 0L
+                                while (true) {
+                                    val count = input.read(block)
+                                    if (count < 0) break
+                                    total += count
+                                    require(total <= 250L * 1024 * 1024) { "Choose a video under 250 MB." }
+                                    output.write(block, 0, count)
+                                }
+                            }
+                        }
+                        val metadata = android.media.MediaMetadataRetriever()
+                        try {
+                            metadata.setDataSource(out.absolutePath)
+                            val duration = metadata.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0
+                            require(duration in 1..60_500) { "Choose a video of 60 seconds or less." }
+                        } finally { metadata.release() }
+                        out
+                    } catch (e: Exception) { out.delete(); throw e }
+                }
+                showSaved(); message("Imported clip ready. Tap Open in Snapchat.")
+            } catch (e: Exception) { message("Could not import: ${e.message}") }
+            busy = false; controls()
+        }
+    }
+
+    private fun recordings() = File(filesDir, "recordings").apply { mkdirs() }
+    private fun message(text: String) { if (!destroyed) status.text = text }
+    private fun showSaved() {
+        if (destroyed) return
+        saved.text = latest?.let { "Latest clip • ${"%.1f".format(it.length() / 1048576.0)} MB\n${it.name}" } ?: "Your recorded clips stay on this phone."
+    }
+    private fun controls() {
+        if (destroyed) return
+        connect.isEnabled = !busy && !recording && session == null
+        start.isEnabled = initialized && registered && session == null && !busy
+        record30.isEnabled = streaming && !recording && !busy
+        record60.isEnabled = record30.isEnabled
+        stop.isEnabled = recording && !busy
+        disconnect.isEnabled = session != null && !busy
+        sound.isEnabled = !recording && !busy
+        val canShare = latest?.exists() == true && !recording && !busy
+        share.isEnabled = canShare; save.isEnabled = canShare; remove.isEnabled = canShare
+    }
+
+    private fun buildUi() {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22), dp(16), dp(22), dp(24))
+            setBackgroundColor(Color.rgb(16, 19, 24))
+        }
+        root.setOnApplyWindowInsetsListener { view, insets ->
+            val bars = insets.getInsets(android.view.WindowInsets.Type.systemBars())
+            view.setPadding(dp(22), dp(16) + bars.top, dp(22), dp(24) + bars.bottom)
+            insets
+        }
+        fun text(value: String, size: Float, color: Int = Color.WHITE) = TextView(this).apply {
+            text = value; textSize = size; setTextColor(color); setPadding(0, dp(4), 0, dp(6))
+        }
+        fun button(label: String, action: () -> Unit) = Button(this).apply {
+            text = label; isAllCaps = false; setOnClickListener { action() }
+        }
+        fun row(vararg buttons: View) {
+            root.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                buttons.forEach { addView(it, LinearLayout.LayoutParams(0, dp(54), 1f).apply { marginEnd = dp(4) }) }
+            })
+        }
+        root.addView(text("GLASSES → SNAPCHAT", 12f, Color.rgb(255, 252, 0)))
+        root.addView(text("Capture your view.", 28f))
+        root.addView(text("Record on your glasses. Share the finished clip.", 14f, Color.LTGRAY))
+        preview = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER; setBackgroundColor(Color.BLACK); contentDescription = "Live preview from your glasses" }
+        root.addView(preview, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(235)))
+        status = text("Setting up…", 14f)
+        root.addView(status)
+        clock = text("Choose 30 or 60 seconds", 22f).apply { gravity = Gravity.CENTER }
+        root.addView(clock)
+        connect = button("Connect Meta AI", ::connectMeta)
+        start = button("Preview glasses", ::requestPreview)
+        row(connect, start)
+        sound = CheckBox(this).apply {
+            text = "Include sound from phone microphone"; isChecked = true; setTextColor(Color.WHITE)
+        }
+        root.addView(sound)
+        record30 = button("Record 30 s") { record(30) }
+        record60 = button("Record 60 s") { record(60) }
+        row(record30, record60)
+        stop = button("Stop & save") { scope.launch { finishRecording() } }
+        disconnect = button("End preview") { endSession() }
+        row(stop, disconnect)
+        saved = text("", 12f, Color.LTGRAY); root.addView(saved)
+        share = button("Open in Snapchat", ::shareVideo)
+        root.addView(share)
+        save = button("Save to Gallery", ::saveToGallery)
+        remove = button("Delete latest") {
+            android.app.AlertDialog.Builder(this).setMessage("Delete this app's latest clip? Gallery copies stay available.")
+                .setNegativeButton("Cancel", null).setPositiveButton("Delete") { _, _ ->
+                    latest?.delete(); latest = null; showSaved(); controls()
+                }.show()
+        }
+        row(save, remove)
+        root.addView(button("Import an existing MP4 clip") {
+            if (!recording && !busy) importVideo.launch(arrayOf("video/mp4"))
+        })
+        root.addView(text("Keep this app open while recording. Snapchat opens after the clip is saved.\nDeveloper prototype • Requires Meta AI Developer Mode.", 12f, Color.GRAY))
+        setContentView(ScrollView(this).apply { addView(root) })
+    }
+
+    private fun dp(value: Int) = (resources.displayMetrics.density * value).toInt()
+
+    override fun onStop() {
+        super.onStop()
+        if (session != null) endSession("Preview ended because the app left the screen. Any recording was stopped and saved.")
+    }
+
+    override fun onDestroy() {
+        destroyed = true
+        connectionTimeout?.cancel()
+        timer?.cancel()
+        sessionScope?.cancel()
+        val oldCamera = camera; val oldSession = session
+        camera = null; session = null
+        scope.launch {
+            withContext(worker) { recorder?.discard(); recorder = null }
+            runCatching { oldCamera?.stop() }
+            runCatching { oldSession?.stop() }
+            scope.cancel()
+            worker.close()
+        }
+        super.onDestroy()
+    }
+}
