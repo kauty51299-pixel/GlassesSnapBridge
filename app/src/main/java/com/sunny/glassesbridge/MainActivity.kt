@@ -57,6 +57,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var save: Button
     private lateinit var remove: Button
     private lateinit var sound: CheckBox
+    private lateinit var autoSnap: CheckBox
     private var initialized = false
     private var initAttempted = false
     private var registered = false
@@ -67,6 +68,11 @@ class MainActivity : ComponentActivity() {
     private var streaming = false
     private var recording = false
     private var busy = false
+    private var foreground = false
+    private var saving = false
+    private var preparingRecording = false
+    private var autoPreviewPending = false
+    private var queuedSeconds: Int? = null
     private var timer: Job? = null
     private var connectionTimeout: Job? = null
     private var latest: File? = null
@@ -83,13 +89,14 @@ class MainActivity : ComponentActivity() {
     }
     private val microphonePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (!granted) { sound.isChecked = false; message("Microphone permission denied. The clip will be silent.") }
-        beginRecording(requestedSeconds)
+        record(requestedSeconds)
     }
     private val glassesPermission = registerForActivityResult(Wearables.RequestPermissionContract()) { result ->
         result.onSuccess { permission ->
-            if (permission == PermissionStatus.Granted) startSession()
-            else { busy = false; message("Camera access was declined in Meta AI."); controls() }
-        }.onFailure { error, _ -> busy = false; message(error.description); controls() }
+            if (permission == PermissionStatus.Granted && foreground) startSession()
+            else if (permission == PermissionStatus.Granted) { busy = false; autoPreviewPending = true }
+            else { busy = false; queuedSeconds = null; message("Camera access was declined in Meta AI. Tap Record to request it again."); controls() }
+        }.onFailure { error, _ -> busy = false; queuedSeconds = null; message(error.description); controls() }
     }
     private val importVideo = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) importClip(uri)
@@ -115,10 +122,13 @@ class MainActivity : ComponentActivity() {
                 initialized = true
                 scope.launch {
                     Wearables.registrationState.collect { state ->
+                        val wasRegistered = registered
                         registered = state == RegistrationState.REGISTERED
-                        if (!recording && !busy) message(if (registered) "Connected to Meta AI. Tap Preview glasses." else "Tap Connect Meta AI to link this app.")
+                        if (registered && !wasRegistered) autoPreviewPending = true
+                        if (!recording && !busy) message(if (registered) "Connected. Choose Record 30 s or Record 60 s." else "Tap Connect Meta AI to link this app.")
                         if (!registered && session != null) endSession("Meta AI connection ended.")
                         controls()
+                        maybeAutoPreview()
                     }
                 }
                 scope.launch {
@@ -136,24 +146,31 @@ class MainActivity : ComponentActivity() {
             return
         }
         initialize()
+        if (registered) {
+            autoPreviewPending = true
+            maybeAutoPreview()
+            return
+        }
         if (initialized) runCatching { Wearables.startRegistration(this) }
             .onFailure { message("Could not open Meta AI: ${it.message}") }
     }
 
     private fun requestPreview() {
-        if (!initialized || !registered || session != null || busy) return
+        if (!initialized || !registered || session != null || busy || !foreground) return
         busy = true; controls()
+        message("Requesting the glasses camera…")
         scope.launch {
             try {
                 Wearables.checkPermissionStatus(Permission.CAMERA).onSuccess {
                     if (it == PermissionStatus.Granted) startSession() else glassesPermission.launch(Permission.CAMERA)
-                }.onFailure { error, _ -> busy = false; message(error.description); controls() }
-            } catch (e: Exception) { busy = false; message(e.message ?: "Camera permission failed."); controls() }
+                }.onFailure { error, _ -> busy = false; queuedSeconds = null; message(error.description); controls() }
+            } catch (e: Exception) { busy = false; queuedSeconds = null; message(e.message ?: "Camera permission failed."); controls() }
         }
     }
 
     private fun startSession() {
-        if (session != null) return
+        if (session != null || !foreground) return
+        busy = true; controls()
         message("Connecting to glasses…")
         scope.launch {
             try {
@@ -183,7 +200,7 @@ class MainActivity : ComponentActivity() {
                         delay(20_000)
                         if (!streaming && session === created) endSession("No camera frames received. Check Bluetooth, Meta AI Developer Mode, and glasses firmware.")
                     }
-                }.onFailure { error, _ -> busy = false; message(error.description); controls() }
+                }.onFailure { error, _ -> busy = false; queuedSeconds = null; message(error.description); controls() }
             } catch (e: Exception) { busy = false; endSession("Connection failed: ${e.message}") }
         }
     }
@@ -224,11 +241,12 @@ class MainActivity : ComponentActivity() {
                                 val image = BitmapFactory.decodeByteArray(jpeg.toByteArray(), 0, jpeg.size())
                                 withContext(Dispatchers.Main.immediate) {
                                     preview.setImageBitmap(image)
-                                    if (!streaming) {
+                                    if (!streaming && session === created && foreground) {
                                         streaming = true; busy = false
                                         connectionTimeout?.cancel()
-                                        message("Glasses preview ready.")
+                                        message("Camera ready. Choose Record 30 s or Record 60 s.")
                                         controls()
+                                        startQueuedRecording()
                                     }
                                 }
                             }
@@ -242,15 +260,38 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun record(seconds: Int) {
-        if (!streaming || recording || busy) return
+        if (!initialized || !registered || recording || saving || preparingRecording || destroyed) return
+        queuedSeconds = seconds
+        clock.text = "${seconds} s selected"
+        if (!foreground) return
+        if (streaming && !busy) {
+            startQueuedRecording()
+        } else {
+            message("${seconds} s selected. Waiting for the glasses camera…")
+            if (session == null && !busy) requestPreview()
+            controls()
+        }
+    }
+
+    private fun startQueuedRecording() {
+        if (!foreground || !streaming || busy || recording || saving || preparingRecording) return
+        val seconds = queuedSeconds ?: return
+        queuedSeconds = null
         requestedSeconds = seconds
         if (sound.isChecked && ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
         } else beginRecording(seconds)
     }
 
+    private fun maybeAutoPreview() {
+        if (!autoPreviewPending || !foreground || !registered || busy || session != null || saving) return
+        autoPreviewPending = false
+        requestPreview()
+    }
+
     private fun beginRecording(seconds: Int) {
-        if (!streaming || recording || busy || destroyed) return
+        if (!streaming || recording || busy || destroyed || !foreground) return
+        preparingRecording = true
         busy = true; controls()
         val withSound = sound.isChecked
         val initialSession = session
@@ -262,10 +303,10 @@ class MainActivity : ComponentActivity() {
                 }
                 if (!streaming || session !== initialSession || destroyed) {
                     withContext(worker) { recorder?.discard(); recorder = null }
-                    busy = false; controls()
+                    preparingRecording = false; busy = false; controls()
                     return@launch
                 }
-                recording = true; busy = false
+                preparingRecording = false; recording = true; busy = false
                 window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 message(created.soundWarning ?: if (withSound) "Recording with phone microphone." else "Recording without sound.")
                 controls()
@@ -273,21 +314,22 @@ class MainActivity : ComponentActivity() {
                     while (isActive && recording) {
                         val elapsed = SystemClock.elapsedRealtime() - created.startedMs
                         clock.text = "${(elapsed / 1000).coerceAtMost(seconds.toLong())} / $seconds s"
-                        if (elapsed >= seconds * 1000L) { finishRecording(); break }
+                        if (elapsed >= seconds * 1000L) { finishRecording(openSnap = true); break }
                         if (SystemClock.elapsedRealtime() - lastFrameMs > 5000) { endSession("Camera frames stopped. Saved the available clip."); break }
                         delay(200)
                     }
                 }
-            } catch (e: Exception) { busy = false; message("Could not record: ${e.message}"); controls() }
+            } catch (e: Exception) { preparingRecording = false; busy = false; message("Could not record: ${e.message}"); controls() }
         }
     }
 
-    private suspend fun finishRecording() {
+    private suspend fun finishRecording(openSnap: Boolean = false) {
         if (!recording) return
-        recording = false; busy = true
+        recording = false; saving = true; busy = true
         timer?.cancel(); timer = null
         // Do not cancel the caller timer before its finalization runs.
         withContext(NonCancellable) {
+            var savedSuccessfully = false
             message("Saving video…"); controls()
             try {
                 val result = withContext(worker) {
@@ -296,16 +338,19 @@ class MainActivity : ComponentActivity() {
                     active.finish() to active.soundWarning
                 }
                 latest = result.first
+                savedSuccessfully = true
                 message(result.second ?: "Video ready. Tap Open in Snapchat.")
                 showSaved()
             } catch (e: Exception) { message("Video could not be saved: ${e.message}") }
-            busy = false
+            saving = false; busy = false
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             controls()
+            if (savedSuccessfully && openSnap && foreground && !destroyed && autoSnap.isChecked) shareVideo()
         }
     }
 
     private fun endSession(reason: String = "Preview ended.") {
+        queuedSeconds = null
         val oldSession = session
         val oldCamera = camera
         session = null; camera = null
@@ -408,11 +453,14 @@ class MainActivity : ComponentActivity() {
         if (destroyed) return
         connect.isEnabled = !busy && !recording && session == null
         start.isEnabled = initialized && registered && session == null && !busy
-        record30.isEnabled = streaming && !recording && !busy
+        // A tap can request the camera; frames are not a prerequisite for tapping.
+        record30.isEnabled = initialized && registered && !recording && !saving && !preparingRecording
         record60.isEnabled = record30.isEnabled
-        stop.isEnabled = recording && !busy
+        stop.text = if (queuedSeconds != null && !recording) "Cancel recording" else "Stop & save"
+        stop.isEnabled = (recording && !busy) || queuedSeconds != null
         disconnect.isEnabled = session != null && !busy
         sound.isEnabled = !recording && !busy
+        autoSnap.isEnabled = !recording && !busy
         val canShare = latest?.exists() == true && !recording && !busy
         share.isEnabled = canShare; save.isEnabled = canShare; remove.isEnabled = canShare
     }
@@ -444,22 +492,31 @@ class MainActivity : ComponentActivity() {
         root.addView(text("Capture your view.", 28f))
         root.addView(text("Record on your glasses. Share the finished clip.", 14f, Color.LTGRAY))
         preview = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER; setBackgroundColor(Color.BLACK); contentDescription = "Live preview from your glasses" }
-        root.addView(preview, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(235)))
+        root.addView(preview, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(170)))
         status = text("Setting up…", 14f)
         root.addView(status)
         clock = text("Choose 30 or 60 seconds", 22f).apply { gravity = Gravity.CENTER }
         root.addView(clock)
+        record30 = button("Record 30 s") { record(30) }
+        record60 = button("Record 60 s") { record(60) }
+        row(record30, record60)
         connect = button("Connect Meta AI", ::connectMeta)
         start = button("Preview glasses", ::requestPreview)
         row(connect, start)
         sound = CheckBox(this).apply {
-            text = "Include sound from phone microphone"; isChecked = true; setTextColor(Color.WHITE)
+            text = "Include sound from phone microphone"; isChecked = false; setTextColor(Color.WHITE)
         }
         root.addView(sound)
-        record30 = button("Record 30 s") { record(30) }
-        record60 = button("Record 60 s") { record(60) }
-        row(record30, record60)
-        stop = button("Stop & save") { scope.launch { finishRecording() } }
+        autoSnap = CheckBox(this).apply {
+            text = "Open Snapchat when recording ends"; isChecked = true; setTextColor(Color.WHITE)
+        }
+        root.addView(autoSnap)
+        stop = button("Stop & save") {
+            if (!recording && queuedSeconds != null) {
+                queuedSeconds = null; clock.text = "Choose 30 or 60 seconds"
+                message("Recording request cancelled."); controls()
+            } else scope.launch { finishRecording(openSnap = true) }
+        }
         disconnect = button("End preview") { endSession() }
         row(stop, disconnect)
         saved = text("", 12f, Color.LTGRAY); root.addView(saved)
@@ -476,14 +533,31 @@ class MainActivity : ComponentActivity() {
         root.addView(button("Import an existing MP4 clip") {
             if (!recording && !busy) importVideo.launch(arrayOf("video/mp4"))
         })
-        root.addView(text("Keep this app open while recording. Snapchat opens after the clip is saved.\nDeveloper prototype • Requires Meta AI Developer Mode.", 12f, Color.GRAY))
+        root.addView(text("Keep this app open while recording. Snapchat opens with the saved clip when the option above is on.\nDeveloper prototype v0.2 • Requires Meta AI Developer Mode.", 12f, Color.GRAY))
         setContentView(ScrollView(this).apply { addView(root) })
     }
 
     private fun dp(value: Int) = (resources.displayMetrics.density * value).toInt()
 
+    override fun onResume() {
+        super.onResume()
+        foreground = true
+        controls()
+        maybeAutoPreview()
+        if (queuedSeconds != null) {
+            if (streaming && !busy) startQueuedRecording()
+            else if (registered && !busy && session == null) requestPreview()
+        }
+    }
+
+    override fun onPause() {
+        foreground = false
+        super.onPause()
+    }
+
     override fun onStop() {
         super.onStop()
+        queuedSeconds = null
         if (session != null) endSession("Preview ended because the app left the screen. Any recording was stopped and saved.")
     }
 
