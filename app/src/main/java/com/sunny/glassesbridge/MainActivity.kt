@@ -1,5 +1,6 @@
 package com.sunny.glassesbridge
 
+import android.app.PendingIntent
 import android.Manifest
 import android.content.ClipData
 import android.content.ContentValues
@@ -78,7 +79,13 @@ class MainActivity : ComponentActivity() {
     private var inputTimeout: Job? = null
     private var inputAttaching = false
     private var inputActive = false
-    private val doublePress = DoublePressGate(650)
+    private val tapSequence = TapSequenceGate(650, 3)
+    private lateinit var tapCountChoice: RadioGroup
+    private lateinit var tapSourceChoice: RadioGroup
+    private val threeTapId = View.generateViewId()
+    private val fourTapId = View.generateViewId()
+    private val touchSourceId = View.generateViewId()
+    private val captureSourceId = View.generateViewId()
     private val duration30Id = View.generateViewId()
     private val duration60Id = View.generateViewId()
     private var initialized = false
@@ -311,7 +318,7 @@ class MainActivity : ComponentActivity() {
 
     private fun copyConnectionDetails() {
         val state = if (initialized) "Registration: ${Wearables.registrationState.value}\nSDK developer mode: ${Wearables.isDevMode}\nVisible glasses: ${Wearables.devices.value.size}" else "SDK not initialized"
-        val report = "Glasses Snap Bridge v0.5\nAndroid ${Build.VERSION.RELEASE} / API ${Build.VERSION.SDK_INT}\nPhone: ${Build.MANUFACTURER} ${Build.MODEL}\n$state\n\nStatus: ${status.text}\n\n${connectionLog.joinToString("\n")}"
+        val report = "Glasses Snap Bridge v0.6\nAndroid ${Build.VERSION.RELEASE} / API ${Build.VERSION.SDK_INT}\nPhone: ${Build.MANUFACTURER} ${Build.MODEL}\n$state\n\nStatus: ${status.text}\n\n${connectionLog.joinToString("\n")}"
         val clipboard = getSystemService(android.content.ClipboardManager::class.java)
         clipboard.setPrimaryClip(ClipData.newPlainText("Connection details", report))
         Toast.makeText(this, "Connection details copied. Paste them into this chat.", Toast.LENGTH_LONG).show()
@@ -398,7 +405,7 @@ class MainActivity : ComponentActivity() {
         handsFreeStatus.text = "Checking glasses button access…"
         jobs.launch {
             try {
-                activeSession.addInputs(InputsConfiguration(sources = setOf(InputSource.CAPTURE_BUTTON), consumeBack = false))
+                activeSession.addInputs(InputsConfiguration(sources = setOf(InputSource.CAPTURE_BUTTON, InputSource.CAPTOUCH), consumeBack = false))
                     .onSuccess { capability ->
                         if (!handsFree.isChecked || session !== activeSession) {
                             inputAttaching = false
@@ -411,9 +418,9 @@ class MainActivity : ComponentActivity() {
                             launch {
                                 capability.state.collect { state ->
                                     inputActive = state == InputsState.ACTIVE
-                                    doublePress.reset()
+                                    tapSequence.reset()
                                     trace("Inputs state: $state")
-                                    handsFreeStatus.text = if (inputActive) "Button ready. Double-press the capture button to record ${if (handsFreeDuration.checkedRadioButtonId == duration60Id) 60 else 30} s."
+                                    handsFreeStatus.text = if (inputActive) tapReadyMessage()
                                         else "Glasses button: $state. Wait for Button ready."
                                     if (inputActive) { inputTimeout?.cancel(); beep(ToneGenerator.TONE_PROP_BEEP) }
                                     controls()
@@ -422,7 +429,7 @@ class MainActivity : ComponentActivity() {
                             launch {
                                 capability.errors.collect { error ->
                                     if (error != null) {
-                                        inputActive = false; doublePress.reset()
+                                        inputActive = false; tapSequence.reset()
                                         trace("Inputs error: $error — ${error.description}")
                                         handsFreeStatus.text = "Glasses button unavailable: ${error.description}. Meta may need to enable Inputs for this app. On-screen recording still works."
                                         controls()
@@ -434,16 +441,15 @@ class MainActivity : ComponentActivity() {
                                     when (event) {
                                         is InputEvent.Capture -> {
                                             trace("Capture button: ${event.pressType}")
-                                            if (event.source == InputSource.CAPTURE_BUTTON && event.pressType == CapturePressType.SHORT_PRESS) {
-                                                val canStart = handsFree.isChecked && inputActive && foreground && streaming && !recording && !saving && !preparingRecording && !busy
-                                                if (canStart && doublePress.shortPress(SystemClock.elapsedRealtime())) {
-                                                    autoSnap.isChecked = true
-                                                    record(if (handsFreeDuration.checkedRadioButtonId == duration60Id) 60 else 30)
-                                                } else if (!canStart) doublePress.reset()
-                                            } else doublePress.reset()
+                                            if (event.source == InputSource.CAPTURE_BUTTON && tapSourceChoice.checkedRadioButtonId == captureSourceId) {
+                                                if (event.pressType == CapturePressType.SHORT_PRESS) receiveTap("button") else tapSequence.reset()
+                                            }
                                         }
-                                        is InputEvent.Nav, is InputEvent.Select, is InputEvent.Back,
-                                        is InputEvent.Button, is InputEvent.Drag -> Unit
+                                        is InputEvent.Select -> {
+                                            trace("Select event from ${event.source}")
+                                            if (event.source == InputSource.CAPTOUCH && tapSourceChoice.checkedRadioButtonId == touchSourceId) receiveTap("touch")
+                                        }
+                                        is InputEvent.Nav, is InputEvent.Back, is InputEvent.Button, is InputEvent.Drag -> tapSequence.reset()
                                     }
                                 }
                             }
@@ -465,8 +471,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun tapReadyMessage(): String {
+        val count = if (tapCountChoice.checkedRadioButtonId == fourTapId) 4 else 3
+        val control = if (tapSourceChoice.checkedRadioButtonId == captureSourceId) "top capture button" else "side touchpad"
+        val duration = if (handsFreeDuration.checkedRadioButtonId == duration60Id) 60 else 30
+        return "Controls ready. Use $count quick taps on the $control for a $duration s recording. Touchpad gestures depend on Meta firmware."
+    }
+
+    private fun receiveTap(source: String) {
+        val canStart = handsFree.isChecked && inputActive && foreground && streaming && !recording && !saving && !preparingRecording && !busy
+        if (!canStart) { tapSequence.reset(); return }
+        if (tapSequence.tap(SystemClock.elapsedRealtime(), source)) {
+            autoSnap.isChecked = true
+            record(if (handsFreeDuration.checkedRadioButtonId == duration60Id) 60 else 30)
+        } else {
+            handsFreeStatus.text = "${tapSequence.count()} of ${if (tapCountChoice.checkedRadioButtonId == fourTapId) 4 else 3} tap events detected."
+        }
+    }
+
     private fun disarmInputs() {
-        doublePress.reset(); inputActive = false
+        tapSequence.reset(); inputActive = false
         inputTimeout?.cancel(); inputTimeout = null
         inputCollectors?.cancel(); inputCollectors = null
         val attached = inputs
@@ -525,7 +549,7 @@ class MainActivity : ComponentActivity() {
                     return@launch
                 }
                 preparingRecording = false; recording = true; busy = false
-                doublePress.reset()
+                tapSequence.reset()
                 if (handsFree.isChecked) beep(ToneGenerator.TONE_PROP_BEEP2)
                 window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 message(created.soundWarning ?: if (withSound) "Recording with phone microphone." else "Recording without sound.")
@@ -571,7 +595,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun endSession(reason: String = "Preview ended.") {
-        doublePress.reset(); inputActive = false; inputAttaching = false
+        tapSequence.reset(); inputActive = false; inputAttaching = false
         inputTimeout?.cancel(); inputTimeout = null
         inputCollectors?.cancel(); inputCollectors = null
         inputs = null
@@ -597,18 +621,71 @@ class MainActivity : ComponentActivity() {
 
     private fun shareVideo() {
         val file = latest?.takeIf { it.exists() } ?: return
+        val clientId = getSharedPreferences("snap_sharing", MODE_PRIVATE).getString("client_id", "").orEmpty().trim()
+        if (clientId.isEmpty()) {
+            message("Clip saved. Snap-editor sharing requires a registered Snap Kit Client ID. Tap Set up Snap sharing.")
+            if (foreground) showSnapSetup()
+            return
+        }
         val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
+        val result = PendingIntent.getBroadcast(this, 76,
+            Intent(this, SnapShareResultReceiver::class.java).setAction("com.sunny.glassesbridge.SNAP_SHARE_RESULT"),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "video/mp4"
+            setDataAndType(Uri.parse("snapchat://creativekit/preview"), "video/*")
+            putExtra("CLIENT_ID", clientId)
+            putExtra("CLIENT_APP_NAME", "Glasses Snap Bridge")
+            putExtra("RESULT_INTENT", result)
             putExtra(Intent.EXTRA_STREAM, uri)
             clipData = ClipData.newRawUri("Glasses video", uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             setPackage("com.snapchat.android")
         }
         try { startActivity(intent) }
         catch (e: Exception) {
-            message("Snapchat could not accept the video. Save to Gallery, then use Snapchat → Memories → Camera Roll.")
+            message("Snap editor could not open: ${e.message}. Verify Snapchat installation and Snap Kit setup. The clip is still saved; no chat attachment was sent.")
         }
+    }
+
+    private fun showSnapSetup() {
+        if (recording || saving || preparingRecording) return
+        val prefs = getSharedPreferences("snap_sharing", MODE_PRIVATE)
+        val field = EditText(this).apply {
+            hint = "Public Snap Kit Client ID"
+            setSingleLine(true)
+            setText(prefs.getString("client_id", ""))
+        }
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setTitle("Set up Snap-editor sharing")
+            .setMessage("Snapchat requires this Android app to be registered for Creative Kit. Enter its public Client ID below. Snapchat validates app approval, package and signing identity. No password or client secret is needed. Without this setup, recordings remain saved in this app.")
+            .setView(field)
+            .setNegativeButton("Cancel", null)
+            .setNeutralButton("Copy Android details") { _, _ ->
+                val fingerprint = runCatching {
+                    @Suppress("DEPRECATION")
+                    val info = packageManager.getPackageInfo(packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+                    info.signingInfo?.apkContentsSigners?.joinToString("\n") { signature ->
+                        java.security.MessageDigest.getInstance("SHA-256").digest(signature.toByteArray())
+                            .joinToString(":") { byte -> "%02X".format(byte.toInt() and 255) }
+                    } ?: "Unavailable"
+                }.getOrDefault("Unavailable")
+                getSystemService(android.content.ClipboardManager::class.java).setPrimaryClip(
+                    ClipData.newPlainText("Android registration", "Package: $packageName\nSHA-256 signing certificate: $fingerprint"))
+                Toast.makeText(this, "Android package and certificate copied.", Toast.LENGTH_LONG).show()
+            }
+            .setPositiveButton("Save", null).create()
+        dialog.setOnShowListener {
+            dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val id = field.text.toString().trim()
+                if (!id.matches(Regex("[A-Za-z0-9_-]{8,128}"))) field.error = "Enter the public Client ID from your Snap developer app."
+                else {
+                    prefs.edit().putString("client_id", id).apply()
+                    message("Client ID saved. Tap Open Snap editor; Snapchat will validate the integration.")
+                    dialog.dismiss()
+                }
+            }
+        }
+        dialog.show()
     }
 
     private fun saveToGallery() {
@@ -692,6 +769,10 @@ class MainActivity : ComponentActivity() {
         handsFree.isEnabled = !recording && !saving && !preparingRecording
         handsFreeDuration.isEnabled = !recording && !saving && !preparingRecording
         for (i in 0 until handsFreeDuration.childCount) handsFreeDuration.getChildAt(i).isEnabled = handsFreeDuration.isEnabled
+        for (group in listOf(tapCountChoice, tapSourceChoice)) {
+            group.isEnabled = !recording && !saving && !preparingRecording
+            for (i in 0 until group.childCount) group.getChildAt(i).isEnabled = group.isEnabled
+        }
         if (foreground && (recording || (handsFree.isChecked && session != null))) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val canShare = latest?.exists() == true && !recording && !busy
@@ -739,22 +820,44 @@ class MainActivity : ComponentActivity() {
         root.addView(status)
         clock = text("Choose 30 or 60 seconds", 22f).apply { gravity = Gravity.CENTER }
         root.addView(clock)
+        tapCountChoice = RadioGroup(this).apply {
+            orientation = RadioGroup.HORIZONTAL
+            addView(RadioButton(this@MainActivity).apply { id = threeTapId; text = "3 taps"; setTextColor(Color.WHITE) })
+            addView(RadioButton(this@MainActivity).apply { id = fourTapId; text = "4 taps"; setTextColor(Color.WHITE) })
+            check(threeTapId)
+            setOnCheckedChangeListener { _, selected ->
+                tapSequence.setRequired(if (selected == fourTapId) 4 else 3)
+                if (inputActive) handsFreeStatus.text = tapReadyMessage()
+            }
+        }
+        root.addView(tapCountChoice)
+        tapSourceChoice = RadioGroup(this).apply {
+            orientation = RadioGroup.HORIZONTAL
+            addView(RadioButton(this@MainActivity).apply { id = touchSourceId; text = "Side touchpad"; setTextColor(Color.WHITE) })
+            addView(RadioButton(this@MainActivity).apply { id = captureSourceId; text = "Top button"; setTextColor(Color.WHITE) })
+            check(touchSourceId)
+            setOnCheckedChangeListener { _, _ ->
+                tapSequence.reset()
+                if (inputActive) handsFreeStatus.text = tapReadyMessage()
+            }
+        }
+        root.addView(tapSourceChoice)
         handsFreeDuration = RadioGroup(this).apply {
             orientation = RadioGroup.HORIZONTAL
             addView(RadioButton(this@MainActivity).apply { id = duration30Id; text = "Button: 30 s"; setTextColor(Color.WHITE) })
             addView(RadioButton(this@MainActivity).apply { id = duration60Id; text = "Button: 60 s"; setTextColor(Color.WHITE) })
             check(duration30Id)
             setOnCheckedChangeListener { _, _ ->
-                doublePress.reset()
-                if (inputActive) handsFreeStatus.text = "Button ready. Double-press to record ${if (checkedRadioButtonId == duration60Id) 60 else 30} s."
+                tapSequence.reset()
+                if (inputActive) handsFreeStatus.text = tapReadyMessage()
             }
         }
         root.addView(handsFreeDuration)
         handsFreeStatus = text("Glasses button off. Requires Meta Inputs access.", 13f, Color.LTGRAY)
         handsFree = CheckBox(this).apply {
-            text = "Arm glasses double-press (experimental)"; setTextColor(Color.WHITE)
+            text = "Arm glasses taps (experimental)"; setTextColor(Color.WHITE)
             setOnCheckedChangeListener { _, armed ->
-                doublePress.reset()
+                tapSequence.reset()
                 if (armed) {
                     autoSnap.isChecked = true
                     handsFreeStatus.text = "Connecting the glasses button…"
@@ -778,7 +881,7 @@ class MainActivity : ComponentActivity() {
         }
         root.addView(sound)
         autoSnap = CheckBox(this).apply {
-            text = "Open Snapchat when recording ends"; isChecked = true; setTextColor(Color.WHITE)
+            text = "Open Snap editor when recording ends"; isChecked = true; setTextColor(Color.WHITE)
         }
         root.addView(autoSnap)
         stop = button("Stop & save") {
@@ -790,8 +893,9 @@ class MainActivity : ComponentActivity() {
         disconnect = button("End preview") { endSession() }
         row(stop, disconnect)
         saved = text("", 12f, Color.LTGRAY); root.addView(saved)
-        share = button("Open in Snapchat", ::shareVideo)
+        share = button("Open Snap editor", ::shareVideo)
         root.addView(share)
+        root.addView(button("Set up Snap sharing") { showSnapSetup() })
         save = button("Save to Gallery", ::saveToGallery)
         remove = button("Delete latest") {
             android.app.AlertDialog.Builder(this).setMessage("Delete this app's latest clip? Gallery copies stay available.")
@@ -815,7 +919,7 @@ class MainActivity : ComponentActivity() {
         root.addView(button("Import an existing MP4 clip") {
             if (!recording && !busy) importVideo.launch(arrayOf("video/mp4"))
         })
-        root.addView(text("Keep this app open while recording. Snapchat opens with the saved clip when the option above is on.\nDeveloper prototype v0.5 • Requires Meta AI Developer Mode.", 12f, Color.GRAY))
+        root.addView(text("Keep this app open while recording. Snapchat opens with the saved clip when the option above is on.\nDeveloper prototype v0.6 • Requires Meta AI Developer Mode.", 12f, Color.GRAY))
         setContentView(ScrollView(this).apply { addView(root) })
     }
 

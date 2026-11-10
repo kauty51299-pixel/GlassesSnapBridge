@@ -7,8 +7,8 @@ android {
         applicationId = "com.sunny.glassesbridge"
         minSdk = 31
         targetSdk = 36
-        versionCode = 5
-        versionName = "0.5.0-logo-preview"
+        versionCode = 6
+        versionName = "0.6.0-snap-preview"
         manifestPlaceholders["mwdat_application_id"] = "0"
         manifestPlaceholders["mwdat_client_token"] = "0"
     }
