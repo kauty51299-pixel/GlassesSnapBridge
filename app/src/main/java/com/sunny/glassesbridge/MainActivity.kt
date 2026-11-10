@@ -311,7 +311,7 @@ class MainActivity : ComponentActivity() {
 
     private fun copyConnectionDetails() {
         val state = if (initialized) "Registration: ${Wearables.registrationState.value}\nSDK developer mode: ${Wearables.isDevMode}\nVisible glasses: ${Wearables.devices.value.size}" else "SDK not initialized"
-        val report = "Glasses Snap Bridge v0.4\nAndroid ${Build.VERSION.RELEASE} / API ${Build.VERSION.SDK_INT}\nPhone: ${Build.MANUFACTURER} ${Build.MODEL}\n$state\n\nStatus: ${status.text}\n\n${connectionLog.joinToString("\n")}"
+        val report = "Glasses Snap Bridge v0.5\nAndroid ${Build.VERSION.RELEASE} / API ${Build.VERSION.SDK_INT}\nPhone: ${Build.MANUFACTURER} ${Build.MODEL}\n$state\n\nStatus: ${status.text}\n\n${connectionLog.joinToString("\n")}"
         val clipboard = getSystemService(android.content.ClipboardManager::class.java)
         clipboard.setPrimaryClip(ClipData.newPlainText("Connection details", report))
         Toast.makeText(this, "Connection details copied. Paste them into this chat.", Toast.LENGTH_LONG).show()
@@ -721,7 +721,16 @@ class MainActivity : ComponentActivity() {
                 buttons.forEach { addView(it, LinearLayout.LayoutParams(0, dp(54), 1f).apply { marginEnd = dp(4) }) }
             })
         }
-        root.addView(text("GLASSES → SNAPCHAT", 12f, Color.rgb(255, 252, 0)))
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(ImageView(this@MainActivity).apply {
+                setImageResource(R.drawable.app_logo)
+                contentDescription = "Glasses Snap Bridge logo"
+                scaleType = ImageView.ScaleType.FIT_CENTER
+            }, LinearLayout.LayoutParams(dp(54), dp(54)).apply { marginEnd = dp(12) })
+            addView(text("GLASSES SNAP BRIDGE", 14f, Color.rgb(255, 220, 0)))
+        })
         root.addView(text("Capture your view.", 28f))
         root.addView(text("Record on your glasses. Share the finished clip.", 14f, Color.LTGRAY))
         preview = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER; setBackgroundColor(Color.BLACK); contentDescription = "Live preview from your glasses" }
@@ -806,7 +815,7 @@ class MainActivity : ComponentActivity() {
         root.addView(button("Import an existing MP4 clip") {
             if (!recording && !busy) importVideo.launch(arrayOf("video/mp4"))
         })
-        root.addView(text("Keep this app open while recording. Snapchat opens with the saved clip when the option above is on.\nDeveloper prototype v0.4 • Requires Meta AI Developer Mode.", 12f, Color.GRAY))
+        root.addView(text("Keep this app open while recording. Snapchat opens with the saved clip when the option above is on.\nDeveloper prototype v0.5 • Requires Meta AI Developer Mode.", 12f, Color.GRAY))
         setContentView(ScrollView(this).apply { addView(root) })
     }
 
